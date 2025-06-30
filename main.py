@@ -31,21 +31,33 @@ def obter_vendas():
         user_response = requests.get("https://api.mercadolibre.com/users/me", headers=headers)
         user_id = user_response.json()['id']
 
-        # 3. Buscar pedidos
-        url = f"https://api.mercadolibre.com/orders/search?seller={user_id}&order.status=paid&sort=date_desc&limit=50"
-        orders_response = requests.get(url, headers=headers)
-        orders = orders_response.json().get('results', [])
-
-        # 4. Organizar dados
+        # 3. Buscar pedidos com paginação até 2.000
         vendas = []
-        for o in orders:
-            vendas.append({
-                "pedido_id": o['id'],
-                "data": o['date_created'],
-                "comprador": o['buyer']['nickname'],
-                "total": o['total_amount'],
-                "status": o['status']
-            })
+        limit = 50
+        offset = 0
+        max_vendas = 2000
+
+        while True:
+            url = f"https://api.mercadolibre.com/orders/search?seller={user_id}&order.status=paid&sort=date_desc&limit={limit}&offset={offset}"
+            response = requests.get(url, headers=headers)
+            data = response.json()
+            results = data.get('results', [])
+
+            if not results:
+                break
+
+            for o in results:
+                vendas.append({
+                    "pedido_id": o['id'],
+                    "data": o['date_created'],
+                    "comprador": o['buyer']['nickname'],
+                    "total": o['total_amount'],
+                    "status": o['status']
+                })
+
+            offset += limit
+            if offset >= max_vendas:
+                break
 
         return JSONResponse(content=vendas)
 
