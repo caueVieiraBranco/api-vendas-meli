@@ -21,7 +21,7 @@ def obter_vendas():
             return {"erro": "CLIENT_ID, CLIENT_SECRET ou REFRESH_TOKEN não definidos nas variáveis de ambiente."}
 
         # 1. Obter access_token via refresh_token
-        token_url = "https://api.mercadolibre.com/oauth/token"
+        token_url = "https://api.mercadolivre.com/oauth/token"
         payload = {
             "grant_type": "refresh_token",
             "client_id": CLIENT_ID,
