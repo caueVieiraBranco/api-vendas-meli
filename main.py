@@ -1,17 +1,20 @@
 from fastapi import FastAPI
 import requests
 from fastapi.responses import JSONResponse
+import os
 
 app = FastAPI()
 
-# === CONFIGURAÇÕES ===
-CLIENT_ID = '6439275970401699'
-CLIENT_SECRET = 'Pw9VVyEx4Wj3iYSeNFVvCWSd44I1j7hZ'
-REFRESH_TOKEN = 'TG-685eefa4befee4000139f1cc-162089212'
+CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+REFRESH_TOKEN = os.getenv("REFRESH_TOKEN")
 
 @app.get("/vendas")
 def obter_vendas():
     try:
+        if not (CLIENT_ID and CLIENT_SECRET and REFRESH_TOKEN):
+            return {"erro": "CLIENT_ID, CLIENT_SECRET ou REFRESH_TOKEN não definidos nas variáveis de ambiente."}
+
         # 1. Obter access_token via refresh_token
         token_url = "https://api.mercadolibre.com/oauth/token"
         payload = {
@@ -22,7 +25,9 @@ def obter_vendas():
         }
         token_response = requests.post(token_url, data=payload)
         tokens = token_response.json()
-        print(tokens)  # Debug opcional
+
+        if 'access_token' not in tokens:
+            return {"erro": "Falha ao obter access_token", "detalhes": tokens}
 
         access_token = tokens['access_token']
         headers = {"Authorization": f"Bearer {access_token}"}
