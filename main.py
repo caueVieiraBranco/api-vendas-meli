@@ -24,6 +24,8 @@ def obter_vendas():
             "refresh_token": REFRESH_TOKEN
         }
         token_response = requests.post(token_url, data=payload)
+        print("🔁 Status:", response.status_code)
+        print("🔁 Body:", response.text)
         tokens = token_response.json()
 
         if 'access_token' not in tokens:
