@@ -9,6 +9,11 @@ CLIENT_ID = os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 REFRESH_TOKEN = os.getenv("REFRESH_TOKEN")
 
+@app.get("/")
+def root():
+    return {"mensagem": "API Mercado Livre ativa"}
+
+
 @app.get("/vendas")
 def obter_vendas():
     try:
@@ -24,9 +29,12 @@ def obter_vendas():
             "refresh_token": REFRESH_TOKEN
         }
         token_response = requests.post(token_url, data=payload)
-        print("🔁 Status:", token_response.status_code)
-        print("🔁 Body:", token_response.text)
+        
+        if token_response.status_code != 200:
+            return {"erro": f"Erro ao obter token. Status: {token_response.status_code}, Body: {token_response.text}"}
+        
         tokens = token_response.json()
+
 
         if 'access_token' not in tokens:
             return {"erro": "Falha ao obter access_token", "detalhes": tokens}
