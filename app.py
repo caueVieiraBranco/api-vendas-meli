@@ -41,7 +41,7 @@ async def healthz():
 
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "meli-webhook", "version": "1.0.0"}
+    return {"ok": True, "service": "meli-webhook", "version": "1.0.1-semantic-filters"}
 
 @app.head("/")
 async def head_root():
@@ -270,7 +270,38 @@ async def meli_webhook(
         # Evita reentrega do ML (respondemos 200)
         return {"status": "fetch_error", "code": e.response.status_code, "order_id": order_id}
 
-    # Aplica regra “venda paga”
+    # ----------------- BLOQUEIOS SEMÂNTICOS -----------------
+    # Normaliza coleções para evitar case sensitivity
+    tags_lower = {str(t).lower() for t in (order.get("tags") or [])}
+    internal_tags_lower = {str(t).lower() for t in (order.get("internal_tags") or [])}
+    fulfilled_true = order.get("fulfilled") is True  # pode ser True/False/None
+
+    # 1) Se já está marcado como cumprido/entregue no objeto do pedido → ignorar
+    if fulfilled_true:
+        return {
+            "status": "ignored_order",
+            "order_id": order_id,
+            "reason": "fulfilled_true"
+        }
+
+    # 2) Se as tags indicam entrega → ignorar
+    if "delivered" in tags_lower:
+        return {
+            "status": "ignored_order",
+            "order_id": order_id,
+            "reason": "tag_delivered"
+        }
+
+    # 3) (Opcional) Se internal_tags mostra etapa fiscal/entrega → ignorar
+    if "invoice_authorized" in internal_tags_lower:
+        return {
+            "status": "ignored_order",
+            "order_id": order_id,
+            "reason": "internal_tag_invoice_authorized"
+        }
+    # --------------------------------------------------------
+
+    # Aplica regra “venda paga” (igual ao seu n8n)
     if not is_valid_sale(order):
         return {
             "status": "ignored_order",
@@ -282,7 +313,7 @@ async def meli_webhook(
     # Marca como processado (antes do forward)
     await mark_order_processed(order_id)
 
-    # Payload enxuto para o n8n (ajuste se quiser mais campos)
+    # Payload enxuto para o n8n (inclui contexto útil para auditoria)
     enriched = {
         "topic": notif.topic,
         "resource": notif.resource,
@@ -293,10 +324,15 @@ async def meli_webhook(
         "seller_id": (order.get("seller") or {}).get("id"),
         "buyer_id": (order.get("buyer") or {}).get("id"),
         "total_amount": order.get("total_amount"),
-        # "order": order,  # se quiser enviar o pedido completo
+        "paid_amount": order.get("paid_amount"),
+        "tags": list(tags_lower),
+        "internal_tags": list(internal_tags_lower),
+        "fulfilled": fulfilled_true,
+        # "order": order,  # descomente se quiser enviar o pedido completo
     }
 
-    # Encaminha ao n8n somente quando for venda válida
+    # Encaminha ao n8n somente quando for venda válida e passar nos filtros semânticos
     forward_result = await post_to_n8n(enriched)
     return {"status": "processed", "order_id": order_id, **forward_result}
+
 
