@@ -1,10 +1,11 @@
-import os, re, json, time, hmac, hashlib, asyncio, logging, math
+import os, re, json, time, hmac, hashlib, asyncio, logging
 from typing import Optional, Dict, Any, List
 from fastapi import FastAPI, Request, Header, HTTPException
 from pydantic import BaseModel
 import httpx
 import aiosqlite
 from datetime import datetime, timezone
+
 try:
     # Python 3.9+ zoneinfo
     from zoneinfo import ZoneInfo
@@ -18,18 +19,20 @@ N8N_WEBHOOK_URL = os.getenv("N8N_SALES_WEBHOOK_URL")  # ex: https://.../webhook/
 ALLOWED_TOPICS = set(os.getenv("ALLOWED_TOPICS", "orders_v2").split(","))
 FORWARD_TIMEOUT = float(os.getenv("FORWARD_TIMEOUT", "15.0"))
 FORWARD_MAX_RETRIES = int(os.getenv("FORWARD_MAX_RETRIES", "3"))
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # opcional, se você quiser validar assinatura
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # opcional (assinatura HMAC)
 CLIENT_ID = os.getenv("ML_CLIENT_ID", "")
 CLIENT_SECRET = os.getenv("ML_CLIENT_SECRET", "")
 REFRESH_TOKEN = os.getenv("ML_REFRESH_TOKEN", "")
 
-if not (CLIENT_ID and CLIENT_SECRET and REFRESH_TOKEN):
-    logging.warning("⚠️ ML_CLIENT_ID/ML_CLIENT_SECRET/ML_REFRESH_TOKEN não configurados. Refresh do token falhará.")
-
 # -----------------------------------------------------------------------------
-# Logging básico
+# Logging
 # -----------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# -----------------------------------------------------------------------------
+# FastAPI app
+# -----------------------------------------------------------------------------
+app = FastAPI(title="ML Webhook (Render) – vendas pagas only")
 
 # -----------------------------------------------------------------------------
 # Token cache
@@ -45,6 +48,8 @@ class TokenCache:
         now = time.time()
         if self._access and now < (self._exp - 30):
             return self._access
+        if not (CLIENT_ID and CLIENT_SECRET and REFRESH_TOKEN):
+            raise RuntimeError("Env ML_CLIENT_ID/ML_CLIENT_SECRET/ML_REFRESH_TOKEN não configurados")
         data = {
             "grant_type": "refresh_token",
             "client_id": CLIENT_ID,
@@ -65,7 +70,7 @@ TOKENS = TokenCache()
 # -----------------------------------------------------------------------------
 # DB idempotência (dedup de entregas e de pedidos já processados)
 # -----------------------------------------------------------------------------
-DB_PATH = "notif.db"
+DB_PATH = os.getenv("DB_PATH", "notif.db")
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -83,8 +88,11 @@ async def init_db():
             processed_at INTEGER NOT NULL
         );""")
         await db.commit()
+    logging.info("📦 SQLite pronto em %s", DB_PATH)
 
-asyncio.get_event_loop().run_until_complete(init_db())
+@app.on_event("startup")
+async def on_startup():
+    await init_db()
 
 async def already_seen_delivery(topic: str, resource: str, sent: Optional[str]) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -137,7 +145,7 @@ def now_brt_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 # -----------------------------------------------------------------------------
-# Modelos básicos
+# Modelos
 # -----------------------------------------------------------------------------
 class MLNotification(BaseModel):
     resource: str
@@ -160,13 +168,11 @@ def is_valid_sale(order: Dict[str, Any]) -> bool:
     status = (order.get("status") or "").lower()
     if status == "paid":
         return True
-
     if status == "confirmed":
         payments: List[Dict[str, Any]] = order.get("payments") or []
         for p in payments:
             if (p.get("status") or "").lower() == "approved":
                 return True
-
     return False
 
 # -----------------------------------------------------------------------------
@@ -205,10 +211,8 @@ async def post_to_n8n(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"forwarded": False, "error": last_err or "unknown"}
 
 # -----------------------------------------------------------------------------
-# FastAPI
+# Handler
 # -----------------------------------------------------------------------------
-app = FastAPI(title="ML Webhook (Render) – vendas pagas only")
-
 @app.post("/meli/webhook")
 async def meli_webhook(
     request: Request,
@@ -251,11 +255,11 @@ async def meli_webhook(
     try:
         order = await fetch_order(order_id)
     except httpx.HTTPStatusError as e:
-        # evita loop de reentrega; loga e segue 200
         logging.warning(f"fetch_order error {e.response.status_code} for order {order_id}")
+        # Evita reentrega do ML
         return {"status": "fetch_error", "code": e.response.status_code, "order_id": order_id}
 
-    # Aplica a regra de venda válida
+    # Aplica a regra de venda válida (espelha seu n8n)
     if not is_valid_sale(order):
         return {
             "status": "ignored_order",
@@ -264,10 +268,10 @@ async def meli_webhook(
             "reason": "not_paid_or_not_approved",
         }
 
-    # Marca como processado (antes de forward para evitar duplicidade em caso de racing)
+    # Marca como processado (antes do forward)
     await mark_order_processed(order_id)
 
-    # Monta payload enxuto (compatível com seu n8n) – você pode expandir aqui o shape
+    # Payload enxuto (compatível com seu n8n); ajuste se quiser mais campos
     now_iso_brt = now_brt_iso()
     enriched = {
         "topic": notif.topic,
@@ -279,11 +283,9 @@ async def meli_webhook(
         "seller_id": (order.get("seller") or {}).get("id"),
         "buyer_id": (order.get("buyer") or {}).get("id"),
         "total_amount": order.get("total_amount"),
-        # Se quiser mandar a ordem completa, atente-se ao payload size. Aqui, mandamos só o essencial:
-        # "order": order,
     }
 
-    # Forward ao n8n apenas quando venda é válida
+    # Encaminha ao seu webhook do n8n somente quando for venda válida
     forward_result = await post_to_n8n(enriched)
     return {"status": "processed", "order_id": order_id, **forward_result}
 
