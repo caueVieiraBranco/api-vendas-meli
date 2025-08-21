@@ -1,80 +1,289 @@
-from fastapi import FastAPI
-import requests
-from fastapi.responses import JSONResponse
-import os
+import os, re, json, time, hmac, hashlib, asyncio, logging, math
+from typing import Optional, Dict, Any, List
+from fastapi import FastAPI, Request, Header, HTTPException
+from pydantic import BaseModel
+import httpx
+import aiosqlite
+from datetime import datetime, timezone
+try:
+    # Python 3.9+ zoneinfo
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 
-app = FastAPI()
+# -----------------------------------------------------------------------------
+# Config via env
+# -----------------------------------------------------------------------------
+N8N_WEBHOOK_URL = os.getenv("N8N_SALES_WEBHOOK_URL")  # ex: https://.../webhook/meli/vendas
+ALLOWED_TOPICS = set(os.getenv("ALLOWED_TOPICS", "orders_v2").split(","))
+FORWARD_TIMEOUT = float(os.getenv("FORWARD_TIMEOUT", "15.0"))
+FORWARD_MAX_RETRIES = int(os.getenv("FORWARD_MAX_RETRIES", "3"))
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # opcional, se você quiser validar assinatura
+CLIENT_ID = os.getenv("ML_CLIENT_ID", "")
+CLIENT_SECRET = os.getenv("ML_CLIENT_SECRET", "")
+REFRESH_TOKEN = os.getenv("ML_REFRESH_TOKEN", "")
 
-CLIENT_ID = os.getenv("CLIENT_ID")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET")
-REFRESH_TOKEN = os.getenv("REFRESH_TOKEN")
+if not (CLIENT_ID and CLIENT_SECRET and REFRESH_TOKEN):
+    logging.warning("⚠️ ML_CLIENT_ID/ML_CLIENT_SECRET/ML_REFRESH_TOKEN não configurados. Refresh do token falhará.")
 
-@app.get("/")
-def root():
-    return {"mensagem": "API Mercado Livre ativa"}
+# -----------------------------------------------------------------------------
+# Logging básico
+# -----------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+# -----------------------------------------------------------------------------
+# Token cache
+# -----------------------------------------------------------------------------
+ML_TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
 
-@app.get("/vendas")
-def obter_vendas():
-    try:
-        if not (CLIENT_ID and CLIENT_SECRET and REFRESH_TOKEN):
-            return {"erro": "CLIENT_ID, CLIENT_SECRET ou REFRESH_TOKEN não definidos nas variáveis de ambiente."}
+class TokenCache:
+    def __init__(self):
+        self._access = None
+        self._exp = 0
 
-        # 1. Obter access_token via refresh_token
-        token_url = "https://api.mercadolibre.com/oauth/token"
-        payload = {
+    async def get(self) -> str:
+        now = time.time()
+        if self._access and now < (self._exp - 30):
+            return self._access
+        data = {
             "grant_type": "refresh_token",
             "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET,
-            "refresh_token": REFRESH_TOKEN
+            "refresh_token": REFRESH_TOKEN,
         }
-        token_response = requests.post(token_url, data=payload)
-        
-        if token_response.status_code != 200:
-            return {"erro": f"Erro ao obter token. Status: {token_response.status_code}, Body: {token_response.text}"}
-        
-        tokens = token_response.json()
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(ML_TOKEN_URL, data=data, headers={"Content-Type":"application/x-www-form-urlencoded"})
+            r.raise_for_status()
+            js = r.json()
+        self._access = js["access_token"]
+        self._exp = now + int(js.get("expires_in", 300))
+        logging.info("🔁 Access token renovado.")
+        return self._access
 
+TOKENS = TokenCache()
 
-        if 'access_token' not in tokens:
-            return {"erro": "Falha ao obter access_token", "detalhes": tokens}
+# -----------------------------------------------------------------------------
+# DB idempotência (dedup de entregas e de pedidos já processados)
+# -----------------------------------------------------------------------------
+DB_PATH = "notif.db"
 
-        access_token = tokens['access_token']
-        headers = {"Authorization": f"Bearer {access_token}"}
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS deliveries (
+            topic TEXT NOT NULL,
+            resource TEXT NOT NULL,
+            sent TEXT,
+            seen_at INTEGER NOT NULL,
+            UNIQUE(topic, resource, sent)
+        );""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS processed_orders (
+            order_id TEXT PRIMARY KEY,
+            processed_at INTEGER NOT NULL
+        );""")
+        await db.commit()
 
-        # 2. Obter ID do usuário
-        user_response = requests.get("https://api.mercadolibre.com/users/me", headers=headers)
-        user_id = user_response.json()['id']
+asyncio.get_event_loop().run_until_complete(init_db())
 
-        # 3. Buscar pedidos com paginação até 2.000
-        vendas = []
-        limit = 50
-        offset = 0
-        max_vendas = 2000
+async def already_seen_delivery(topic: str, resource: str, sent: Optional[str]) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                "INSERT INTO deliveries(topic, resource, sent, seen_at) VALUES(?,?,?,?)",
+                (topic, resource, sent or "", int(time.time()))
+            )
+            await db.commit()
+            return False
+        except Exception:
+            return True
 
-        while True:
-            url = f"https://api.mercadolibre.com/orders/search?seller={user_id}&order.status=paid&sort=date_desc&limit={limit}&offset={offset}"
-            response = requests.get(url, headers=headers)
-            data = response.json()
-            results = data.get('results', [])
+async def mark_order_processed(order_id: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO processed_orders(order_id, processed_at) VALUES(?,?)",
+            (order_id, int(time.time()))
+        )
+        await db.commit()
 
-            if not results:
-                break
+async def order_already_processed(order_id: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM processed_orders WHERE order_id = ? LIMIT 1", (order_id,)) as cur:
+            row = await cur.fetchone()
+            return row is not None
 
-            for o in results:
-                vendas.append({
-                    "pedido_id": o['id'],
-                    "data": o['date_created'],
-                    "comprador": o['buyer']['nickname'],
-                    "total": o['total_amount'],
-                    "status": o['status']
-                })
+# -----------------------------------------------------------------------------
+# Utils
+# -----------------------------------------------------------------------------
+def verify_signature_if_any(raw: bytes, signature: Optional[str]) -> bool:
+    if not WEBHOOK_SECRET:
+        return True
+    if not signature:
+        return False
+    calc = hmac.new(WEBHOOK_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+    if signature.startswith("sha256="):
+        signature = signature.split("=",1)[1]
+    return hmac.compare_digest(calc, signature)
 
-            offset += limit
-            if offset >= max_vendas:
-                break
+def extract_order_id(resource: str) -> Optional[str]:
+    # /orders/{id}
+    m = re.search(r"/orders/(\d+)", resource or "")
+    return m.group(1) if m else None
 
-        return JSONResponse(content=vendas)
+def now_brt_iso():
+    # America/Sao_Paulo ISO
+    if ZoneInfo:
+        return datetime.now(ZoneInfo("America/Sao_Paulo")).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
+# -----------------------------------------------------------------------------
+# Modelos básicos
+# -----------------------------------------------------------------------------
+class MLNotification(BaseModel):
+    resource: str
+    topic: str
+    user_id: Optional[int] = None
+    application_id: Optional[int] = None
+    attempts: Optional[int] = None
+    sent: Optional[str] = None
+    received: Optional[str] = None
+
+# -----------------------------------------------------------------------------
+# Regra de venda válida (espelhando seu n8n)
+# -----------------------------------------------------------------------------
+def is_valid_sale(order: Dict[str, Any]) -> bool:
+    """
+    Regra:
+      - order.status == "paid"  -> válido
+      - OR (order.status == "confirmed" and exists any payment.status == "approved")
+    """
+    status = (order.get("status") or "").lower()
+    if status == "paid":
+        return True
+
+    if status == "confirmed":
+        payments: List[Dict[str, Any]] = order.get("payments") or []
+        for p in payments:
+            if (p.get("status") or "").lower() == "approved":
+                return True
+
+    return False
+
+# -----------------------------------------------------------------------------
+# Fetch order com include=payments
+# -----------------------------------------------------------------------------
+async def fetch_order(order_id: str) -> Dict[str, Any]:
+    token = await TOKENS.get()
+    url = f"https://api.mercadolibre.com/orders/{order_id}"
+    params = {"include": "payments"}  # traz pagamentos embutidos
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url, params=params, headers={"Authorization": f"Bearer {token}"})
+        r.raise_for_status()
+        return r.json()
+
+# -----------------------------------------------------------------------------
+# Forward ao n8n com retry exponencial
+# -----------------------------------------------------------------------------
+async def post_to_n8n(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not N8N_WEBHOOK_URL:
+        return {"forwarded": False, "error": "N8N_SALES_WEBHOOK_URL not set"}
+    delay = 0.8
+    last_err = None
+    async with httpx.AsyncClient(timeout=FORWARD_TIMEOUT) as client:
+        for attempt in range(1, FORWARD_MAX_RETRIES + 1):
+            try:
+                resp = await client.post(
+                    N8N_WEBHOOK_URL,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+                return {"forwarded": True, "n8n_status": resp.status_code, "n8n_body": resp.text}
+            except httpx.HTTPError as e:
+                last_err = str(e)
+                await asyncio.sleep(delay)
+                delay *= 2
+    return {"forwarded": False, "error": last_err or "unknown"}
+
+# -----------------------------------------------------------------------------
+# FastAPI
+# -----------------------------------------------------------------------------
+app = FastAPI(title="ML Webhook (Render) – vendas pagas only")
+
+@app.post("/meli/webhook")
+async def meli_webhook(
+    request: Request,
+    x_hub_signature_256: Optional[str] = Header(default=None),
+):
+    raw = await request.body()
+    if not verify_signature_if_any(raw, x_hub_signature_256):
+        raise HTTPException(status_code=401, detail="invalid signature")
+
+    # Tenta JSON
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON")
+
+    # Normaliza notificação
+    try:
+        notif = MLNotification(**data)
     except Exception as e:
-        return {"erro": str(e)}
+        raise HTTPException(status_code=400, detail=f"bad payload: {e}")
+
+    # Idempotência de entrega (topic+resource+sent)
+    if await already_seen_delivery(notif.topic, notif.resource, notif.sent):
+        return {"status": "ok", "dedup_delivery": True}
+
+    # Filtra por topic
+    if notif.topic not in ALLOWED_TOPICS:
+        return {"status": "ignored", "reason": "topic_not_allowed", "topic": notif.topic}
+
+    # Extrai order_id
+    order_id = extract_order_id(notif.resource)
+    if not order_id:
+        return {"status": "ignored", "reason": "no_order_id", "resource": notif.resource}
+
+    # Debounce de pedido já processado
+    if await order_already_processed(order_id):
+        return {"status": "ok", "dedup_order": True, "order_id": order_id}
+
+    # Busca a ordem com pagamentos
+    try:
+        order = await fetch_order(order_id)
+    except httpx.HTTPStatusError as e:
+        # evita loop de reentrega; loga e segue 200
+        logging.warning(f"fetch_order error {e.response.status_code} for order {order_id}")
+        return {"status": "fetch_error", "code": e.response.status_code, "order_id": order_id}
+
+    # Aplica a regra de venda válida
+    if not is_valid_sale(order):
+        return {
+            "status": "ignored_order",
+            "order_id": order_id,
+            "order_status": order.get("status"),
+            "reason": "not_paid_or_not_approved",
+        }
+
+    # Marca como processado (antes de forward para evitar duplicidade em caso de racing)
+    await mark_order_processed(order_id)
+
+    # Monta payload enxuto (compatível com seu n8n) – você pode expandir aqui o shape
+    now_iso_brt = now_brt_iso()
+    enriched = {
+        "topic": notif.topic,
+        "resource": notif.resource,
+        "order_id": order_id,
+        "sent": notif.sent or now_iso_brt,
+        "sent_unix": int(time.time()),
+        "order_status": order.get("status"),
+        "seller_id": (order.get("seller") or {}).get("id"),
+        "buyer_id": (order.get("buyer") or {}).get("id"),
+        "total_amount": order.get("total_amount"),
+        # Se quiser mandar a ordem completa, atente-se ao payload size. Aqui, mandamos só o essencial:
+        # "order": order,
+    }
+
+    # Forward ao n8n apenas quando venda é válida
+    forward_result = await post_to_n8n(enriched)
+    return {"status": "processed", "order_id": order_id, **forward_result}
+
