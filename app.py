@@ -1,4 +1,4 @@
-import os, re, json, time, hmac, hashlib, asyncio, logging
+import os, re, time, hmac, hashlib, asyncio, logging
 from typing import Optional, Dict, Any, List
 from fastapi import FastAPI, Request, Header, HTTPException
 from pydantic import BaseModel
@@ -23,6 +23,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # opcional (assinatura HMAC)
 CLIENT_ID = os.getenv("ML_CLIENT_ID", "")
 CLIENT_SECRET = os.getenv("ML_CLIENT_SECRET", "")
 REFRESH_TOKEN = os.getenv("ML_REFRESH_TOKEN", "")
+DB_PATH = os.getenv("DB_PATH", "notif.db")
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -30,12 +31,24 @@ REFRESH_TOKEN = os.getenv("ML_REFRESH_TOKEN", "")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # -----------------------------------------------------------------------------
-# FastAPI app
+# FastAPI app + health endpoints
 # -----------------------------------------------------------------------------
 app = FastAPI(title="ML Webhook (Render) – vendas pagas only")
 
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
+
+@app.get("/")
+async def root():
+    return {"ok": True, "service": "meli-webhook", "version": "1.0.0"}
+
+@app.head("/")
+async def head_root():
+    return {}
+
 # -----------------------------------------------------------------------------
-# Token cache
+# Token cache (refresh com refresh_token)
 # -----------------------------------------------------------------------------
 ML_TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
 
@@ -68,10 +81,8 @@ class TokenCache:
 TOKENS = TokenCache()
 
 # -----------------------------------------------------------------------------
-# DB idempotência (dedup de entregas e de pedidos já processados)
+# SQLite idempotência (entregas + pedidos)
 # -----------------------------------------------------------------------------
-DB_PATH = os.getenv("DB_PATH", "notif.db")
-
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -163,7 +174,7 @@ def is_valid_sale(order: Dict[str, Any]) -> bool:
     """
     Regra:
       - order.status == "paid"  -> válido
-      - OR (order.status == "confirmed" and exists any payment.status == "approved")
+      - OU (order.status == "confirmed" e existe payment.status == "approved")
     """
     status = (order.get("status") or "").lower()
     if status == "paid":
@@ -211,7 +222,7 @@ async def post_to_n8n(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"forwarded": False, "error": last_err or "unknown"}
 
 # -----------------------------------------------------------------------------
-# Handler
+# Handler principal
 # -----------------------------------------------------------------------------
 @app.post("/meli/webhook")
 async def meli_webhook(
@@ -256,10 +267,10 @@ async def meli_webhook(
         order = await fetch_order(order_id)
     except httpx.HTTPStatusError as e:
         logging.warning(f"fetch_order error {e.response.status_code} for order {order_id}")
-        # Evita reentrega do ML
+        # Evita reentrega do ML (respondemos 200)
         return {"status": "fetch_error", "code": e.response.status_code, "order_id": order_id}
 
-    # Aplica a regra de venda válida (espelha seu n8n)
+    # Aplica regra “venda paga”
     if not is_valid_sale(order):
         return {
             "status": "ignored_order",
@@ -271,21 +282,21 @@ async def meli_webhook(
     # Marca como processado (antes do forward)
     await mark_order_processed(order_id)
 
-    # Payload enxuto (compatível com seu n8n); ajuste se quiser mais campos
-    now_iso_brt = now_brt_iso()
+    # Payload enxuto para o n8n (ajuste se quiser mais campos)
     enriched = {
         "topic": notif.topic,
         "resource": notif.resource,
         "order_id": order_id,
-        "sent": notif.sent or now_iso_brt,
+        "sent": notif.sent or now_brt_iso(),
         "sent_unix": int(time.time()),
         "order_status": order.get("status"),
         "seller_id": (order.get("seller") or {}).get("id"),
         "buyer_id": (order.get("buyer") or {}).get("id"),
         "total_amount": order.get("total_amount"),
+        # "order": order,  # se quiser enviar o pedido completo
     }
 
-    # Encaminha ao seu webhook do n8n somente quando for venda válida
+    # Encaminha ao n8n somente quando for venda válida
     forward_result = await post_to_n8n(enriched)
     return {"status": "processed", "order_id": order_id, **forward_result}
 
