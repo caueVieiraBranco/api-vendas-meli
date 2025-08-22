@@ -41,7 +41,7 @@ async def healthz():
 
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "meli-webhook", "version": "1.0.1-semantic-filters"}
+    return {"ok": True, "service": "meli-webhook", "version": "1.1.0-dedupe-atomic"}
 
 @app.head("/")
 async def head_root():
@@ -105,31 +105,44 @@ async def init_db():
 async def on_startup():
     await init_db()
 
+# Dedupa entregas: agora deduplica por (topic, resource), independente de 'sent'
 async def already_seen_delivery(topic: str, resource: str, sent: Optional[str]) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM deliveries WHERE topic = ? AND resource = ? LIMIT 1",
+            (topic, resource)
+        ) as cur:
+            row = await cur.fetchone()
+            if row:
+                return True
+        await db.execute(
+            "INSERT INTO deliveries(topic, resource, sent, seen_at) VALUES(?,?,?,?)",
+            (topic, resource, sent or "", int(time.time()))
+        )
+        await db.commit()
+        return False
+
+# Claim atômico do pedido: só o primeiro request segue
+async def claim_order(order_id: str) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         try:
             await db.execute(
-                "INSERT INTO deliveries(topic, resource, sent, seen_at) VALUES(?,?,?,?)",
-                (topic, resource, sent or "", int(time.time()))
+                "INSERT INTO processed_orders(order_id, processed_at) VALUES(?,?)",
+                (order_id, int(time.time()))
             )
             await db.commit()
-            return False
-        except Exception:
             return True
+        except Exception:
+            return False  # já existe
 
-async def mark_order_processed(order_id: str) -> None:
+# Só para telemetria (mantém updated_at)
+async def finalize_order(order_id: str) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT OR REPLACE INTO processed_orders(order_id, processed_at) VALUES(?,?)",
-            (order_id, int(time.time()))
+            "UPDATE processed_orders SET processed_at = ? WHERE order_id = ?",
+            (int(time.time()), order_id)
         )
         await db.commit()
-
-async def order_already_processed(order_id: str) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT 1 FROM processed_orders WHERE order_id = ? LIMIT 1", (order_id,)) as cur:
-            row = await cur.fetchone()
-            return row is not None
 
 # -----------------------------------------------------------------------------
 # Utils
@@ -245,7 +258,7 @@ async def meli_webhook(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"bad payload: {e}")
 
-    # Idempotência de entrega (topic+resource+sent)
+    # Dedup de entrega (topic+resource), independente de 'sent'
     if await already_seen_delivery(notif.topic, notif.resource, notif.sent):
         return {"status": "ok", "dedup_delivery": True}
 
@@ -258,8 +271,9 @@ async def meli_webhook(
     if not order_id:
         return {"status": "ignored", "reason": "no_order_id", "resource": notif.resource}
 
-    # Debounce de pedido já processado
-    if await order_already_processed(order_id):
+    # Claim atômico: só o primeiro request para este order_id segue
+    got_claim = await claim_order(order_id)
+    if not got_claim:
         return {"status": "ok", "dedup_order": True, "order_id": order_id}
 
     # Busca a ordem com pagamentos
@@ -267,41 +281,25 @@ async def meli_webhook(
         order = await fetch_order(order_id)
     except httpx.HTTPStatusError as e:
         logging.warning(f"fetch_order error {e.response.status_code} for order {order_id}")
-        # Evita reentrega do ML (respondemos 200)
+        # Respondemos 200 para evitar reentrega do ML
         return {"status": "fetch_error", "code": e.response.status_code, "order_id": order_id}
 
     # ----------------- BLOQUEIOS SEMÂNTICOS -----------------
-    # Normaliza coleções para evitar case sensitivity
     tags_lower = {str(t).lower() for t in (order.get("tags") or [])}
     internal_tags_lower = {str(t).lower() for t in (order.get("internal_tags") or [])}
-    fulfilled_true = order.get("fulfilled") is True  # pode ser True/False/None
+    fulfilled_true = order.get("fulfilled") is True  # True/False/None
 
-    # 1) Se já está marcado como cumprido/entregue no objeto do pedido → ignorar
     if fulfilled_true:
-        return {
-            "status": "ignored_order",
-            "order_id": order_id,
-            "reason": "fulfilled_true"
-        }
+        return {"status": "ignored_order", "order_id": order_id, "reason": "fulfilled_true"}
 
-    # 2) Se as tags indicam entrega → ignorar
     if "delivered" in tags_lower:
-        return {
-            "status": "ignored_order",
-            "order_id": order_id,
-            "reason": "tag_delivered"
-        }
+        return {"status": "ignored_order", "order_id": order_id, "reason": "tag_delivered"}
 
-    # 3) (Opcional) Se internal_tags mostra etapa fiscal/entrega → ignorar
     if "invoice_authorized" in internal_tags_lower:
-        return {
-            "status": "ignored_order",
-            "order_id": order_id,
-            "reason": "internal_tag_invoice_authorized"
-        }
+        return {"status": "ignored_order", "order_id": order_id, "reason": "internal_tag_invoice_authorized"}
     # --------------------------------------------------------
 
-    # Aplica regra “venda paga” (igual ao seu n8n)
+    # Regra “venda paga”
     if not is_valid_sale(order):
         return {
             "status": "ignored_order",
@@ -310,10 +308,7 @@ async def meli_webhook(
             "reason": "not_paid_or_not_approved",
         }
 
-    # Marca como processado (antes do forward)
-    await mark_order_processed(order_id)
-
-    # Payload enxuto para o n8n (inclui contexto útil para auditoria)
+    # Payload para o n8n
     enriched = {
         "topic": notif.topic,
         "resource": notif.resource,
@@ -328,11 +323,16 @@ async def meli_webhook(
         "tags": list(tags_lower),
         "internal_tags": list(internal_tags_lower),
         "fulfilled": fulfilled_true,
-        # "order": order,  # descomente se quiser enviar o pedido completo
+        # "order": order,  # descomente para enviar o pedido completo
     }
 
-    # Encaminha ao n8n somente quando for venda válida e passar nos filtros semânticos
+    # Encaminha ao n8n somente quando for venda válida e passar nos filtros
     forward_result = await post_to_n8n(enriched)
+
+    # Finaliza (telemetria)
+    await finalize_order(order_id)
+
     return {"status": "processed", "order_id": order_id, **forward_result}
+
 
 
