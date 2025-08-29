@@ -1,7 +1,7 @@
 import os, re, time, hmac, hashlib, asyncio, logging
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from fastapi import FastAPI, Request, Header, HTTPException
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse, PlainTextResponse
 import httpx
 import aiosqlite
 from datetime import datetime, timezone
@@ -12,327 +12,435 @@ try:
 except Exception:
     ZoneInfo = None
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Config via env
-# -----------------------------------------------------------------------------
-N8N_WEBHOOK_URL = os.getenv("N8N_SALES_WEBHOOK_URL")  # ex: https://.../webhook/meli/vendas
-ALLOWED_TOPICS = set(os.getenv("ALLOWED_TOPICS", "orders_v2").split(","))
-FORWARD_TIMEOUT = float(os.getenv("FORWARD_TIMEOUT", "15.0"))
-FORWARD_MAX_RETRIES = int(os.getenv("FORWARD_MAX_RETRIES", "3"))
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # opcional (assinatura HMAC)
-CLIENT_ID = os.getenv("ML_CLIENT_ID", "")
-CLIENT_SECRET = os.getenv("ML_CLIENT_SECRET", "")
-REFRESH_TOKEN = os.getenv("ML_REFRESH_TOKEN", "")
+# =============================================================================
+SERVICE_NAME = os.getenv("SERVICE_NAME", "meli-webhook")
+SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.2.0-state-gate")
+
+ALLOWED_TOPICS = [t.strip() for t in os.getenv("ALLOWED_TOPICS", "orders_v2").split(",") if t.strip()]
+N8N_SALES_WEBHOOK_URL = os.getenv("N8N_SALES_WEBHOOK_URL", "").strip()
+
+# Mercado Livre OAuth (refresh)
+ML_CLIENT_ID = os.getenv("ML_CLIENT_ID", "").strip()
+ML_CLIENT_SECRET = os.getenv("ML_CLIENT_SECRET", "").strip()
+ML_REFRESH_TOKEN = os.getenv("ML_REFRESH_TOKEN", "").strip()
+
+# Persistência local (efêmera no Render Free)
 DB_PATH = os.getenv("DB_PATH", "notif.db")
 
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# Segurança opcional (HMAC do corpo do webhook do ML)
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").encode("utf-8") if os.getenv("WEBHOOK_SECRET") else None
 
-# -----------------------------------------------------------------------------
-# FastAPI app + health endpoints
-# -----------------------------------------------------------------------------
-app = FastAPI(title="ML Webhook (Render) – vendas pagas only")
+# Post para n8n
+FORWARD_TIMEOUT = float(os.getenv("FORWARD_TIMEOUT", "15.0"))
+FORWARD_MAX_RETRIES = int(os.getenv("FORWARD_MAX_RETRIES", "3"))
+FORWARD_BACKOFF_BASE = float(os.getenv("FORWARD_BACKOFF_BASE", "0.8"))
 
+# Supressão temporal de reentregas muito tardias (opcional)
+LATE_DUPLICATE_SECONDS = int(os.getenv("LATE_DUPLICATE_SECONDS", str(24 * 3600)))  # 24h
+
+# Logging simples
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# =============================================================================
+# App
+# =============================================================================
+app = FastAPI(title=SERVICE_NAME, version=SERVICE_VERSION)
+
+# globais do processo
+_http: httpx.AsyncClient | None = None
+_db: aiosqlite.Connection | None = None
+
+# =============================================================================
+# Helpers gerais
+# =============================================================================
+def _now_utc_ts() -> int:
+    return int(time.time())
+
+def parse_iso_to_ts(iso_str: str | None) -> int | None:
+    if not iso_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+def verify_hmac_sha256(secret: bytes, raw_body: bytes, sig_header: str) -> bool:
+    """
+    Espera header no formato: "sha256=<HEX>"
+    """
+    try:
+        algo, hexsig = sig_header.split("=", 1)
+        if algo.lower() != "sha256":
+            return False
+        mac = hmac.new(secret, msg=raw_body, digestmod=hashlib.sha256)
+        expected = mac.hexdigest()
+        # compare constant-time
+        return hmac.compare_digest(expected, hexsig.strip())
+    except Exception:
+        return False
+
+def extract_order_id(resource_path: str) -> Optional[str]:
+    """
+    Ex.: "/orders/200001234567890" -> "200001234567890"
+    """
+    m = re.search(r"/orders/(\d+)", resource_path or "")
+    return m.group(1) if m else None
+
+# =============================================================================
+# DB (SQLite, efêmero)
+# =============================================================================
+async def init_db(conn: aiosqlite.Connection) -> None:
+    await conn.execute("""
+    CREATE TABLE IF NOT EXISTS deliveries (
+        topic TEXT NOT NULL,
+        resource TEXT NOT NULL,
+        sent TEXT NOT NULL,
+        seen_at INTEGER NOT NULL,
+        UNIQUE(topic, resource, sent)
+    );
+    """)
+    await conn.execute("""
+    CREATE TABLE IF NOT EXISTS processed_orders (
+        order_id TEXT PRIMARY KEY,
+        processed_at INTEGER NOT NULL
+    );
+    """)
+    await conn.execute("""
+    CREATE TABLE IF NOT EXISTS order_state (
+        order_id TEXT PRIMARY KEY,
+        forwarded_status TEXT,          -- "paid" ou "confirmed_approved"
+        first_forwarded_at INTEGER      -- epoch seconds
+    );
+    """)
+    await conn.commit()
+    logging.info("📦 SQLite pronto em %s", DB_PATH)
+
+async def mark_delivery(topic: str, resource: str, sent: str) -> bool:
+    """
+    Retorna True se inseriu (1ª vez), False se já existia (duplicado).
+    """
+    assert _db is not None
+    try:
+        await _db.execute(
+            "INSERT INTO deliveries(topic, resource, sent, seen_at) VALUES(?,?,?,?)",
+            (topic, resource, sent or "", _now_utc_ts())
+        )
+        await _db.commit()
+        return True
+    except Exception:
+        return False
+
+async def claim_order(order_id: str) -> bool:
+    """
+    Claim atômico para evitar corrida (em-processo). Remove no finalize_order().
+    True = conseguiu claim; False = já havia claim ativo.
+    """
+    assert _db is not None
+    try:
+        await _db.execute(
+            "INSERT INTO processed_orders(order_id, processed_at) VALUES(?,?)",
+            (order_id, _now_utc_ts())
+        )
+        await _db.commit()
+        return True
+    except Exception:
+        return False
+
+async def finalize_order(order_id: str) -> None:
+    assert _db is not None
+    try:
+        await _db.execute("DELETE FROM processed_orders WHERE order_id = ?", (order_id,))
+        await _db.commit()
+    except Exception:
+        pass
+
+async def get_order_state(order_id: str) -> Tuple[Optional[str], Optional[int]]:
+    assert _db is not None
+    cur = await _db.execute(
+        "SELECT forwarded_status, first_forwarded_at FROM order_state WHERE order_id = ?",
+        (order_id,)
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    if row:
+        return row[0], row[1]
+    return None, None
+
+async def upsert_order_state(order_id: str, status_key: str, ts: Optional[int] = None) -> None:
+    assert _db is not None
+    ts = ts or _now_utc_ts()
+    await _db.execute("""
+        INSERT INTO order_state(order_id, forwarded_status, first_forwarded_at)
+        VALUES(?,?,?)
+        ON CONFLICT(order_id) DO UPDATE SET
+            forwarded_status = excluded.forwarded_status
+    """, (order_id, status_key, ts))
+    await _db.commit()
+
+# =============================================================================
+# ML OAuth Token cache
+# =============================================================================
+class TokenCache:
+    def __init__(self):
+        self._token: Optional[str] = None
+        self._exp_ts: int = 0
+
+    async def get_token(self) -> str:
+        now = _now_utc_ts()
+        if self._token and now < (self._exp_ts - 30):
+            return self._token
+        await self.refresh()
+        return self._token or ""
+
+    async def refresh(self) -> None:
+        if not (ML_CLIENT_ID and ML_CLIENT_SECRET and ML_REFRESH_TOKEN):
+            raise RuntimeError("ML OAuth envs ausentes (ML_CLIENT_ID/SECRET/REFRESH_TOKEN).")
+        assert _http is not None
+        data = {
+            "grant_type": "refresh_token",
+            "client_id": ML_CLIENT_ID,
+            "client_secret": ML_CLIENT_SECRET,
+            "refresh_token": ML_REFRESH_TOKEN,
+        }
+        resp = await _http.post(
+            "https://api.mercadolibre.com/oauth/token",
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=FORWARD_TIMEOUT,
+        )
+        if resp.status_code >= 400:
+            logging.error("🔐 Refresh token falhou: %s %s", resp.status_code, resp.text)
+            raise HTTPException(status_code=500, detail="Erro ao renovar token do ML.")
+        js = resp.json()
+        self._token = js.get("access_token")
+        self._exp_ts = _now_utc_ts() + int(js.get("expires_in", 1800))
+
+token_cache = TokenCache()
+
+# =============================================================================
+# N8N forwarding
+# =============================================================================
+async def post_to_n8n(payload: Dict[str, Any], idempotency_key: Optional[str] = None) -> Dict[str, Any]:
+    if not N8N_SALES_WEBHOOK_URL:
+        logging.warning("⚠️ N8N_SALES_WEBHOOK_URL não configurada; simulando sucesso.")
+        return {"n8n_status": 204, "n8n_body": None}
+
+    assert _http is not None
+    headers = {"Content-Type": "application/json"}
+    if idempotency_key:
+        headers["X-Idempotency-Key"] = idempotency_key
+
+    delay = FORWARD_BACKOFF_BASE
+    last_exc: Exception | None = None
+
+    for attempt in range(1, FORWARD_MAX_RETRIES + 1):
+        try:
+            resp = await _http.post(
+                N8N_SALES_WEBHOOK_URL, json=payload, headers=headers, timeout=FORWARD_TIMEOUT
+            )
+            ok = 200 <= resp.status_code < 300
+            if ok:
+                return {"n8n_status": resp.status_code, "n8n_body": _safe_json(resp)}
+            else:
+                logging.warning("➡️ n8n tentativa %s falhou: %s %s", attempt, resp.status_code, resp.text)
+        except Exception as e:
+            last_exc = e
+            logging.warning("➡️ n8n tentativa %s exception: %r", attempt, e)
+
+        await asyncio.sleep(delay)
+        delay *= 2
+
+    # deu ruim
+    if last_exc:
+        logging.error("❌ Falha ao encaminhar ao n8n: %r", last_exc)
+    return {"n8n_status": 599, "n8n_body": None}
+
+def _safe_json(resp: httpx.Response) -> Any:
+    try:
+        return resp.json()
+    except Exception:
+        return resp.text
+
+# =============================================================================
+# Regra de decisão por “transição de estado”
+# =============================================================================
+def derive_status_key(order_json: Dict[str, Any]) -> Optional[str]:
+    """
+    Retorna "paid" ou "confirmed_approved" quando for estado-gatilho. Caso contrário, None.
+    """
+    status = (order_json or {}).get("status")
+    if status == "paid":
+        return "paid"
+    if status == "confirmed":
+        payments = order_json.get("payments") or []
+        if any(p.get("status") == "approved" for p in payments):
+            return "confirmed_approved"
+    return None
+
+def should_block_semantic(order_json: Dict[str, Any]) -> Optional[str]:
+    """
+    Bloqueios semânticos antes da regra principal (opcional).
+    Ex.: pedido já cumprido/entregue/fat. autorizado → ignora.
+    """
+    if order_json.get("fulfilled") is True:
+        return "already_fulfilled"
+    tags = set(order_json.get("tags") or [])
+    if "delivered" in tags:
+        return "already_delivered"
+    internal = set(order_json.get("internal_tags") or [])
+    if "invoice_authorized" in internal:
+        return "invoice_authorized"
+    return None
+
+# =============================================================================
+# FastAPI lifecycle
+# =============================================================================
+@app.on_event("startup")
+async def on_startup():
+    global _http, _db
+    # http client
+    _http = httpx.AsyncClient(follow_redirects=True)
+    # db
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    _db = await aiosqlite.connect(DB_PATH)
+    await init_db(_db)
+    logging.info("🚀 %s %s iniciado", SERVICE_NAME, SERVICE_VERSION)
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    global _http, _db
+    try:
+        if _http:
+            await _http.aclose()
+    finally:
+        _http = None
+    try:
+        if _db:
+            await _db.close()
+    finally:
+        _db = None
+
+# =============================================================================
+# Endpoints básicos
+# =============================================================================
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True}
+    return {"ok": True, "service": SERVICE_NAME, "version": SERVICE_VERSION}
 
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "meli-webhook", "version": "1.1.0-dedupe-atomic"}
+    return {"ok": True, "service": SERVICE_NAME, "version": SERVICE_VERSION}
 
 @app.head("/")
 async def head_root():
-    return {}
+    return PlainTextResponse("", status_code=200)
 
-# -----------------------------------------------------------------------------
-# Token cache (refresh com refresh_token)
-# -----------------------------------------------------------------------------
-ML_TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
-
-class TokenCache:
-    def __init__(self):
-        self._access = None
-        self._exp = 0
-
-    async def get(self) -> str:
-        now = time.time()
-        if self._access and now < (self._exp - 30):
-            return self._access
-        if not (CLIENT_ID and CLIENT_SECRET and REFRESH_TOKEN):
-            raise RuntimeError("Env ML_CLIENT_ID/ML_CLIENT_SECRET/ML_REFRESH_TOKEN não configurados")
-        data = {
-            "grant_type": "refresh_token",
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "refresh_token": REFRESH_TOKEN,
-        }
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.post(ML_TOKEN_URL, data=data, headers={"Content-Type":"application/x-www-form-urlencoded"})
-            r.raise_for_status()
-            js = r.json()
-        self._access = js["access_token"]
-        self._exp = now + int(js.get("expires_in", 300))
-        logging.info("🔁 Access token renovado.")
-        return self._access
-
-TOKENS = TokenCache()
-
-# -----------------------------------------------------------------------------
-# SQLite idempotência (entregas + pedidos)
-# -----------------------------------------------------------------------------
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS deliveries (
-            topic TEXT NOT NULL,
-            resource TEXT NOT NULL,
-            sent TEXT,
-            seen_at INTEGER NOT NULL,
-            UNIQUE(topic, resource, sent)
-        );""")
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS processed_orders (
-            order_id TEXT PRIMARY KEY,
-            processed_at INTEGER NOT NULL
-        );""")
-        await db.commit()
-    logging.info("📦 SQLite pronto em %s", DB_PATH)
-
-@app.on_event("startup")
-async def on_startup():
-    await init_db()
-
-# Dedupa entregas: agora deduplica por (topic, resource), independente de 'sent'
-async def already_seen_delivery(topic: str, resource: str, sent: Optional[str]) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT 1 FROM deliveries WHERE topic = ? AND resource = ? LIMIT 1",
-            (topic, resource)
-        ) as cur:
-            row = await cur.fetchone()
-            if row:
-                return True
-        await db.execute(
-            "INSERT INTO deliveries(topic, resource, sent, seen_at) VALUES(?,?,?,?)",
-            (topic, resource, sent or "", int(time.time()))
-        )
-        await db.commit()
-        return False
-
-# Claim atômico do pedido: só o primeiro request segue
-async def claim_order(order_id: str) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        try:
-            await db.execute(
-                "INSERT INTO processed_orders(order_id, processed_at) VALUES(?,?)",
-                (order_id, int(time.time()))
-            )
-            await db.commit()
-            return True
-        except Exception:
-            return False  # já existe
-
-# Só para telemetria (mantém updated_at)
-async def finalize_order(order_id: str) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE processed_orders SET processed_at = ? WHERE order_id = ?",
-            (int(time.time()), order_id)
-        )
-        await db.commit()
-
-# -----------------------------------------------------------------------------
-# Utils
-# -----------------------------------------------------------------------------
-def verify_signature_if_any(raw: bytes, signature: Optional[str]) -> bool:
-    if not WEBHOOK_SECRET:
-        return True
-    if not signature:
-        return False
-    calc = hmac.new(WEBHOOK_SECRET.encode(), raw, hashlib.sha256).hexdigest()
-    if signature.startswith("sha256="):
-        signature = signature.split("=",1)[1]
-    return hmac.compare_digest(calc, signature)
-
-def extract_order_id(resource: str) -> Optional[str]:
-    # /orders/{id}
-    m = re.search(r"/orders/(\d+)", resource or "")
-    return m.group(1) if m else None
-
-def now_brt_iso():
-    # America/Sao_Paulo ISO
-    if ZoneInfo:
-        return datetime.now(ZoneInfo("America/Sao_Paulo")).isoformat(timespec="seconds")
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-# -----------------------------------------------------------------------------
-# Modelos
-# -----------------------------------------------------------------------------
-class MLNotification(BaseModel):
-    resource: str
-    topic: str
-    user_id: Optional[int] = None
-    application_id: Optional[int] = None
-    attempts: Optional[int] = None
-    sent: Optional[str] = None
-    received: Optional[str] = None
-
-# -----------------------------------------------------------------------------
-# Regra de venda válida (espelhando seu n8n)
-# -----------------------------------------------------------------------------
-def is_valid_sale(order: Dict[str, Any]) -> bool:
-    """
-    Regra:
-      - order.status == "paid"  -> válido
-      - OU (order.status == "confirmed" e existe payment.status == "approved")
-    """
-    status = (order.get("status") or "").lower()
-    if status == "paid":
-        return True
-    if status == "confirmed":
-        payments: List[Dict[str, Any]] = order.get("payments") or []
-        for p in payments:
-            if (p.get("status") or "").lower() == "approved":
-                return True
-    return False
-
-# -----------------------------------------------------------------------------
-# Fetch order com include=payments
-# -----------------------------------------------------------------------------
-async def fetch_order(order_id: str) -> Dict[str, Any]:
-    token = await TOKENS.get()
-    url = f"https://api.mercadolibre.com/orders/{order_id}"
-    params = {"include": "payments"}  # traz pagamentos embutidos
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(url, params=params, headers={"Authorization": f"Bearer {token}"})
-        r.raise_for_status()
-        return r.json()
-
-# -----------------------------------------------------------------------------
-# Forward ao n8n com retry exponencial
-# -----------------------------------------------------------------------------
-async def post_to_n8n(payload: Dict[str, Any]) -> Dict[str, Any]:
-    if not N8N_WEBHOOK_URL:
-        return {"forwarded": False, "error": "N8N_SALES_WEBHOOK_URL not set"}
-    delay = 0.8
-    last_err = None
-    async with httpx.AsyncClient(timeout=FORWARD_TIMEOUT) as client:
-        for attempt in range(1, FORWARD_MAX_RETRIES + 1):
-            try:
-                resp = await client.post(
-                    N8N_WEBHOOK_URL,
-                    json=payload,
-                    headers={"Content-Type": "application/json"},
-                )
-                return {"forwarded": True, "n8n_status": resp.status_code, "n8n_body": resp.text}
-            except httpx.HTTPError as e:
-                last_err = str(e)
-                await asyncio.sleep(delay)
-                delay *= 2
-    return {"forwarded": False, "error": last_err or "unknown"}
-
-# -----------------------------------------------------------------------------
-# Handler principal
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Webhook do ML
+# =============================================================================
 @app.post("/meli/webhook")
 async def meli_webhook(
     request: Request,
-    x_hub_signature_256: Optional[str] = Header(default=None),
+    x_hub_signature_256: Optional[str] = Header(default=None, alias="X-Hub-Signature-256"),
 ):
+    """
+    Recebe notificações do Mercado Livre e decide se encaminha ao n8n.
+    """
     raw = await request.body()
-    if not verify_signature_if_any(raw, x_hub_signature_256):
-        raise HTTPException(status_code=401, detail="invalid signature")
 
-    # Tenta JSON
+    # 1) HMAC opcional
+    if WEBHOOK_SECRET:
+        if not x_hub_signature_256 or not verify_hmac_sha256(WEBHOOK_SECRET, raw, x_hub_signature_256):
+            logging.warning("🔒 HMAC inválido/ausente; ignorando.")
+            return JSONResponse({"ok": True, "ignored": "bad_hmac"}, status_code=200)
+
+    # 2) JSON do ML
     try:
-        data = await request.json()
+        payload = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="invalid JSON")
+        logging.warning("⚠️ Body não-JSON; ignorando.")
+        return JSONResponse({"ok": True, "ignored": "bad_json"}, status_code=200)
 
-    # Normaliza notificação
-    try:
-        notif = MLNotification(**data)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"bad payload: {e}")
+    topic = (payload or {}).get("topic")
+    resource = (payload or {}).get("resource") or ""
+    sent_iso = (payload or {}).get("sent")
+    sent_unix = parse_iso_to_ts(sent_iso)
 
-    # Dedup de entrega (topic+resource), independente de 'sent'
-    if await already_seen_delivery(notif.topic, notif.resource, notif.sent):
-        return {"status": "ok", "dedup_delivery": True}
+    if topic not in ALLOWED_TOPICS:
+        return {"ok": True, "ignored": "topic_not_allowed", "topic": topic}
 
-    # Filtra por topic
-    if notif.topic not in ALLOWED_TOPICS:
-        return {"status": "ignored", "reason": "topic_not_allowed", "topic": notif.topic}
-
-    # Extrai order_id
-    order_id = extract_order_id(notif.resource)
+    order_id = extract_order_id(resource or "")
     if not order_id:
-        return {"status": "ignored", "reason": "no_order_id", "resource": notif.resource}
+        return {"ok": True, "ignored": "no_order_id", "resource": resource}
 
-    # Claim atômico: só o primeiro request para este order_id segue
-    got_claim = await claim_order(order_id)
-    if not got_claim:
-        return {"status": "ok", "dedup_order": True, "order_id": order_id}
+    # 3) Dedup por evento (topic, resource, sent)
+    is_first_delivery = await mark_delivery(topic, resource, sent_iso or "")
+    if not is_first_delivery:
+        return {"ok": True, "ignored": "duplicate_delivery", "order_id": order_id}
 
-    # Busca a ordem com pagamentos
+    # 4) Claim atômico por pedido (evita corrida entre eventos simultâneos)
+    if not await claim_order(order_id):
+        return {"ok": True, "ignored": "already_processing", "order_id": order_id}
+
     try:
-        order = await fetch_order(order_id)
-    except httpx.HTTPStatusError as e:
-        logging.warning(f"fetch_order error {e.response.status_code} for order {order_id}")
-        # Respondemos 200 para evitar reentrega do ML
-        return {"status": "fetch_error", "code": e.response.status_code, "order_id": order_id}
+        # 5) Busca do pedido no ML (include=payments)
+        token = await token_cache.get_token()
+        assert _http is not None
+        ml_url = f"https://api.mercadolibre.com/orders/{order_id}?include=payments"
+        resp = await _http.get(ml_url, headers={"Authorization": f"Bearer {token}"}, timeout=FORWARD_TIMEOUT)
 
-    # ----------------- BLOQUEIOS SEMÂNTICOS -----------------
-    tags_lower = {str(t).lower() for t in (order.get("tags") or [])}
-    internal_tags_lower = {str(t).lower() for t in (order.get("internal_tags") or [])}
-    fulfilled_true = order.get("fulfilled") is True  # True/False/None
+        if resp.status_code >= 400:
+            logging.warning("🟠 GET order falhou: %s %s", resp.status_code, resp.text)
+            return {"ok": True, "status": "fetch_error", "order_id": order_id, "http": resp.status_code}
 
-    if fulfilled_true:
-        return {"status": "ignored_order", "order_id": order_id, "reason": "fulfilled_true"}
+        order = resp.json() or {}
 
-    if "delivered" in tags_lower:
-        return {"status": "ignored_order", "order_id": order_id, "reason": "tag_delivered"}
+        # 6) Bloqueios semânticos (opcional)
+        block_reason = should_block_semantic(order)
+        if block_reason:
+            return {"ok": True, "ignored": block_reason, "order_id": order_id}
 
-    if "invoice_authorized" in internal_tags_lower:
-        return {"status": "ignored_order", "order_id": order_id, "reason": "internal_tag_invoice_authorized"}
-    # --------------------------------------------------------
+        # 7) Decisão por transição de estado
+        status_key = derive_status_key(order)
+        prev_status, first_ts = await get_order_state(order_id)
 
-    # Regra “venda paga”
-    if not is_valid_sale(order):
-        return {
-            "status": "ignored_order",
-            "order_id": order_id,
-            "order_status": order.get("status"),
-            "reason": "not_paid_or_not_approved",
-        }
+        # (opcional) supressão temporal caso reentrega venha muito tarde
+        if first_ts and sent_unix and LATE_DUPLICATE_SECONDS > 0:
+            if sent_unix > first_ts + LATE_DUPLICATE_SECONDS:
+                return {"ok": True, "ignored": "late_duplicate", "order_id": order_id}
 
-    # Payload para o n8n
-    enriched = {
-        "topic": notif.topic,
-        "resource": notif.resource,
-        "order_id": order_id,
-        "sent": notif.sent or now_brt_iso(),
-        "sent_unix": int(time.time()),
-        "order_status": order.get("status"),
-        "seller_id": (order.get("seller") or {}).get("id"),
-        "buyer_id": (order.get("buyer") or {}).get("id"),
-        "total_amount": order.get("total_amount"),
-        "paid_amount": order.get("paid_amount"),
-        "tags": list(tags_lower),
-        "internal_tags": list(internal_tags_lower),
-        "fulfilled": fulfilled_true,
-        # "order": order,  # descomente para enviar o pedido completo
-    }
+        if status_key in ("paid", "confirmed_approved") and (prev_status != status_key):
+            # 8) Encaminhar ao n8n
+            idemp_key = f"order-{order_id}-{status_key}"
+            body = {
+                "topic": topic,
+                "resource": resource,
+                "sent": sent_iso,
+                "sent_unix": sent_unix,
+                "order_id": order_id,
+                "decision": "forwarded",
+                "forwarded_status": status_key,
+                "order_status": order.get("status"),
+                "paid_amount": order.get("paid_amount"),
+                "total_amount": order.get("total_amount"),
+                "tags": order.get("tags"),
+                "internal_tags": order.get("internal_tags"),
+                # Se preferir enviar o JSON inteiro do pedido, descomente:
+                # "order": order,
+            }
+            forward_result = await post_to_n8n(body, idempotency_key=idemp_key)
 
-    # Encaminha ao n8n somente quando for venda válida e passar nos filtros
-    forward_result = await post_to_n8n(enriched)
+            # 9) Memorizar o estado para bloquear reentregas complementares
+            await upsert_order_state(order_id, status_key)
 
-    # Finaliza (telemetria)
-    await finalize_order(order_id)
+            return {"ok": True, "forwarded": status_key, "order_id": order_id, **forward_result}
 
-    return {"status": "processed", "order_id": order_id, **forward_result}
+        # Nada novo de relevante
+        return {"ok": True, "ignored": "no_state_transition", "order_id": order_id, "order_status": order.get("status")}
 
-
-
+    finally:
+        # 10) Libera claim do pedido
+        await finalize_order(order_id)
