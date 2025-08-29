@@ -400,14 +400,20 @@ async def meli_webhook(
 
         order = resp.json() or {}
 
-        # 6) Bloqueios semânticos (opcional)
-        block_reason = should_block_semantic(order)
-        if block_reason:
-            return {"ok": True, "ignored": block_reason, "order_id": order_id}
-
-        # 7) Decisão por transição de estado
+        # 6) Decisão por transição de estado
         status_key = derive_status_key(order)
         prev_status, first_ts = await get_order_state(order_id)
+        
+        # 6.1) Bloqueios semânticos (com opção de desativar/burlar em teste)
+        if not DISABLE_SEMANTIC_BLOCKS:
+            block_reason = should_block_semantic(order)
+            if block_reason:
+                # Se for 1º gatilho e queremos permitir mesmo se fulfilled/delivered, só em teste:
+                if ALLOW_TRIGGER_WHEN_FULFILLED and status_key in ("paid", "confirmed_approved") and (prev_status != status_key):
+                    pass  # deixa passar para teste controlado
+                else:
+                    return {"ok": True, "ignored": block_reason, "order_id": order_id}
+
 
         # (opcional) supressão temporal caso reentrega venha muito tarde
         if first_ts and sent_unix and LATE_DUPLICATE_SECONDS > 0:
