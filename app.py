@@ -20,6 +20,8 @@ SERVICE_VERSION = os.getenv("SERVICE_VERSION", "1.2.0-state-gate")
 
 ALLOWED_TOPICS = [t.strip() for t in os.getenv("ALLOWED_TOPICS", "orders_v2").split(",") if t.strip()]
 N8N_SALES_WEBHOOK_URL = os.getenv("N8N_SALES_WEBHOOK_URL", "").strip()
+DISABLE_SEMANTIC_BLOCKS = os.getenv("DISABLE_SEMANTIC_BLOCKS", "0") == "1"
+ALLOW_TRIGGER_WHEN_FULFILLED = os.getenv("ALLOW_TRIGGER_WHEN_FULFILLED", "0") == "1"
 
 # Mercado Livre OAuth (refresh)
 ML_CLIENT_ID = os.getenv("ML_CLIENT_ID", "").strip()
