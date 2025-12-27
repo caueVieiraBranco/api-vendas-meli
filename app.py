@@ -241,6 +241,7 @@ async def meli_webhook(request: Request, x_hub_signature_256: Optional[str] = He
     topic = payload.get("topic")
     resource = payload.get("resource")
     sent_iso = payload.get("sent")
+    sent_unix = parse_iso_to_ts(sent_iso)
 
     logging.info("📥 Webhook recebido | topic=%s | resource=%s | sent=%s", topic, resource, sent_iso)
 
