@@ -284,11 +284,43 @@ async def meli_webhook(request: Request, x_hub_signature_256: Optional[str] = He
             return {"ok": True, "ignored": block}
 
         if status_key and status_key != prev_status:
-            logging.info("➡️ Enviando ao n8n | order_id=%s | status_key=%s", order_id, status_key)
-            result = await post_to_n8n({"order_id": order_id, "status": status_key})
-            logging.info("✅ Retorno n8n | order_id=%s | result=%s", order_id, result)
+            logging.info("➡️ Encaminhando para n8n | order_id=%s | status_key=%s", order_id, status_key)
+
+            body = {
+                "topic": topic,
+                "resource": resource,
+                "sent": sent_iso,
+                "sent_unix": sent_unix,
+                "order_id": order_id,
+                "decision": "forwarded",
+                "forwarded_status": status_key,
+                "order_status": order.get("status"),
+                "paid_amount": order.get("paid_amount"),
+                "total_amount": order.get("total_amount"),
+                "tags": order.get("tags"),
+                "internal_tags": order.get("internal_tags"),
+                # "order": order,  # opcional, manter comentado
+            }
+        
+            forward_result = await post_to_n8n(
+                body,
+                idempotency_key=f"order-{order_id}-{status_key}"
+            )
+        
+            logging.info(
+                "✅ Retorno n8n | order_id=%s | result=%s",
+                order_id, forward_result
+            )
+        
             await upsert_order_state(order_id, status_key)
-            return {"ok": True, "forwarded": status_key}
+        
+            return {
+                "ok": True,
+                "forwarded": status_key,
+                "order_id": order_id,
+                **forward_result
+            }
+
 
         logging.info("⏭️ Nenhuma transição relevante | order_id=%s", order_id)
         return {"ok": True, "ignored": "no_transition"}
